@@ -83,7 +83,7 @@ card yet.
 | Firmware | Stock `V3.4.88EN` |
 | What TokenTV uses | `/v.json`, `/.sys/album.json`, `/space.json`, `/doUpload?dir=/image` (form field `update`), `/set?album_path=...&album_autoplay=0`, `/set?open_app=Picture` (first time only) |
 | Still / GIF | Both: the default animated face and still faces applied from the dashboard show on the clock |
-| Notes | Two files per kind are taken in turn, so the picture playing is never written over. Opening the Picture app again while it plays leaves the screen black, so it is opened once and later switches set only the album's picture |
+| Notes | Two files per kind are taken in turn, so the picture playing is never written over. A picture set while the Picture app is still opening is dropped and the screen stays black, so the app is opened once per start, the picture follows 3 s later, and later switches set only the album's picture |
 | Restore | The album's picture and autoplay come back; the app shown before cannot be read, so it is not restored. Not checked on the clock |
 | Host | macOS (Apple Silicon), Python 3.13, TokenTV 0.6.2 from source |
 | Date | 2026-11-19 |

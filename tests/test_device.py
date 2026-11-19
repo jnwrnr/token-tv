@@ -594,6 +594,9 @@ PRO_BACKUP = {"model": "pro", "autoplay": 1, "path": "/image/cat.gif"}
 
 class ProTests(unittest.TestCase):
     def setUp(self):
+        patcher = patch.object(ProDisplay, "OPEN_SECONDS", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.state = {"autoplay": 1, "path": "/image/cat.gif", "app": "Clock", "files": {"cat.gif": b"CAT"}, "parts": []}
         self.calls = []
 

@@ -299,6 +299,7 @@ class ProDisplay(UltraDisplay):
     /set?album_path=...&album_autoplay=0 and the Picture app is brought forward with /set?open_app=Picture.
     The app the clock showed before cannot be read back, so a restore returns the album's picture and autoplay only."""
     MODEL = "pro"
+    OPEN_SECONDS = 3  # how long the Picture app takes to come up before it takes a picture
     # Two files per kind, taken in turn: the picture playing is never written over (that left the clock black), and
     # a new picture always has a new path, so selecting it makes the clock load it instead of keeping its cached one.
     PRO_SLOTS = {"jpg": ("tokentv.jpg", "tokentv-b.jpg"), "gif": ("tokentv.gif", "tokentv-b.gif")}
@@ -358,8 +359,11 @@ class ProDisplay(UltraDisplay):
         # Open the Picture app only when we have not put it up yet: opening it again while it plays reloads it and
         # leaves the screen black (seen on V3.4.88EN). A switch between our files sets the album's picture alone,
         # as the clock's own web UI does; autoplay off, so the owner's photos never rotate in.
+        # The picture is set after the app has come up: set while it is still opening, it is dropped and the screen
+        # stays black until the picture is set again (seen on V3.4.88EN, every time TokenTV started).
         if self.active is None:
             self.request("/set?open_app=Picture")
+            time.sleep(self.OPEN_SECONDS)
         self.request("/set?" + urlencode({"album_path": "/image/" + name, "album_autoplay": 0}, quote_via=quote))
 
     def restore(self, original):
