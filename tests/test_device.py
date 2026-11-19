@@ -14,7 +14,8 @@ from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
 
 from token_tv import live
-from token_tv.device import BackupMismatch, PhotoDisplay, UltraDisplay, open_display
+from token_tv.device import (BackupMismatch, PhotoDisplay, ProDisplay, UltraDisplay, clock_info, model_kind,
+                             open_display, verified)
 
 
 class DisplayTests(unittest.TestCase):
@@ -153,6 +154,49 @@ def ultra_clock(state, calls):
                 state["parts"].append((part.get_param("name", header="content-disposition"), part.get_filename(),
                                        part.get_content_type(), part.get_payload(decode=True)))
                 if self.path == "/doUpload?dir=/image/" and part.get_param("name", header="content-disposition") == "file":
+                    state["files"][part.get_filename()] = part.get_payload(decode=True)
+            self.reply("OK")
+    return Handler
+
+
+def pro_clock(state, calls):
+    """SmallTV-PRO (ESP32) stock web API, as its own web UI uses it on firmware V3.4.88EN."""
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            return
+        def reply(self, data, status=200):
+            body = json.dumps(data).encode()
+            self.send_response(status)
+            self.end_headers()
+            self.wfile.write(body)
+        def do_GET(self):
+            calls.append(("GET", self.path))
+            url = urlparse(self.path)
+            if url.path == "/v.json":
+                return self.reply({"m": "GeekMagic SmallTV-PRO", "v": "V3.4.88EN"})
+            if url.path == "/.sys/album.json":
+                return self.reply({"gif_loop": "5", "i_i": "30", "autoplay": state["autoplay"], "path": state["path"]})
+            if url.path == "/space.json":
+                return self.reply({"total": 3866624, "free": state.get("free", 1000000)})
+            if url.path == "/set":
+                query = {key: values[0] for key, values in parse_qs(url.query).items()}
+                if "album_path" in query:
+                    state["path"] = query["album_path"]
+                if "album_autoplay" in query:
+                    state["autoplay"] = int(query["album_autoplay"])
+                if "open_app" in query:
+                    state["app"] = query["open_app"]
+                return self.reply("OK")
+            self.reply({}, 404)
+        def do_POST(self):
+            calls.append(("POST", self.path))
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            form = email.message_from_bytes(b"Content-Type: " + self.headers["Content-Type"].encode() + b"\r\n\r\n" + body,
+                                            policy=email.policy.HTTP)
+            for part in form.iter_parts():
+                field = part.get_param("name", header="content-disposition")
+                state["parts"].append((field, part.get_filename(), part.get_content_type(), part.get_payload(decode=True)))
+                if self.path == "/doUpload?dir=%2Fimage" and field == "update":
                     state["files"][part.get_filename()] = part.get_payload(decode=True)
             self.reply("OK")
     return Handler
@@ -407,7 +451,7 @@ class UltraTests(unittest.TestCase):
         answers = [(200, b'{"m": "SmallTV-Ultra", "v": "Ultra-V9.0.54"}', UltraDisplay),
                    (404, b"", PhotoDisplay), (200, b'{"m": null}', PhotoDisplay), (200, b'{"m": 5}', PhotoDisplay),
                    (200, b'["SmallTV-Ultra"]', PhotoDisplay), (200, b"<html></html>", PhotoDisplay),
-                   (200, b"\xff", PhotoDisplay), (200, b'{"m": "SmallTV-PRO"}', PhotoDisplay),
+                   (200, b"\xff", PhotoDisplay), (200, b'{"m": "SmallTV-PRO"}', ProDisplay),
                    (200, b'{"m": "NotUltraAtAll"}', PhotoDisplay)]
         for status, body, expected in answers:
             with self.subTest(body=body), serve(answering(status, body)) as url:
@@ -543,6 +587,109 @@ class UltraTests(unittest.TestCase):
             backup.write_text(json.dumps(SD_PRO_BACKUP), encoding="utf-8")
             self.assertEqual(live.load_original(PhotoDisplay(url), backup), SD_PRO_BACKUP)
             self.assertEqual(self.calls[start:], [])
+
+
+PRO_BACKUP = {"model": "pro", "autoplay": 1, "path": "/image/cat.gif"}
+
+
+class ProTests(unittest.TestCase):
+    def setUp(self):
+        self.state = {"autoplay": 1, "path": "/image/cat.gif", "app": "Clock", "files": {"cat.gif": b"CAT"}, "parts": []}
+        self.calls = []
+
+    def test_model_names_map_to_their_api(self):
+        for model, kind in (("GeekMagic SmallTV-PRO", "pro"), ("SmallTV-PRO", "pro"), ("SmallTV-Ultra", "ultra"),
+                            ("GeekMagic SmallTV-Ultra", "ultra"), ("SmallTV", "sdpro"), ("NotAClock", None),
+                            (None, None), (5, None)):
+            with self.subTest(model=model):
+                self.assertEqual(model_kind(model), kind)
+
+    def test_pro_contract_backup_upload_show_and_restore(self):
+        with serve(pro_clock(self.state, self.calls)) as url:
+            display = open_display(url)
+            self.assertIsInstance(display, ProDisplay)
+            self.assertEqual(self.calls, [("GET", "/v.json")])
+            original = display.capture()
+            self.assertEqual(original, PRO_BACKUP)
+            self.assertEqual(json.loads(json.dumps(original)), original)  # survives display-original.json
+
+            start = len(self.calls)
+            display.upload("tokentv.jpg", b"EXACT-JPEG")
+            display.upload("tokentv.gif", b"GIF89a-EXACT")
+            for name, image in (("other.jpg", b"JPEG"), ("tokentv.jpg", b""), ("tokentv.jpg", b"x" * 60001)):
+                with self.assertRaises(ValueError):
+                    display.upload(name, image)
+            self.assertEqual(self.calls[start:], [("POST", "/doUpload?dir=%2Fimage")] * 2)
+            self.assertEqual(self.state["parts"], [("update", "tokentv.jpg", "image/jpeg", b"EXACT-JPEG"),
+                                                   ("update", "tokentv.gif", "image/gif", b"GIF89a-EXACT")])
+
+            # First time: bring the Picture app forward, then fix the album on our picture with autoplay off.
+            start = len(self.calls)
+            display.activate(original)
+            self.assertEqual(self.calls[start:], [("GET", "/set?open_app=Picture"),
+                                                  ("GET", "/set?album_path=%2Fimage%2Ftokentv.jpg&album_autoplay=0")])
+            # Once ours is up, a switch sets the picture alone: opening the app again blanks the screen.
+            display.active = "tokentv.jpg"
+            start = len(self.calls)
+            display.activate(original, "tokentv-b.jpg")
+            self.assertEqual(self.calls[start:], [("GET", "/set?album_path=%2Fimage%2Ftokentv-b.jpg&album_autoplay=0")])
+            self.assertEqual((self.state["path"], self.state["autoplay"], self.state["app"]),
+                             ("/image/tokentv-b.jpg", 0, "Picture"))
+
+            # The album's own picture and autoplay come back; the app shown before cannot be read, so it stays.
+            start = len(self.calls)
+            display.restore(original)
+            self.assertEqual(self.calls[start:], [("GET", "/set?album_autoplay=1&album_path=%2Fimage%2Fcat.gif")])
+            self.assertEqual((self.state["path"], self.state["autoplay"]), ("/image/cat.gif", 1))
+            self.assertEqual(self.state["files"], {"cat.gif": b"CAT", "tokentv.jpg": b"EXACT-JPEG", "tokentv.gif": b"GIF89a-EXACT"})
+            paths = [c[1] for c in self.calls]
+            self.assertFalse(any(word in p for p in paths for word in ("delete", "clear", "reset", "reboot")))
+
+    def test_pro_never_writes_the_playing_file_and_switches_to_every_new_picture(self):
+        with serve(pro_clock(self.state, self.calls)) as url:
+            display = open_display(url)
+            original = display.capture()
+            shown = []
+            for image in (b"GIF-1", b"GIF-2", b"GIF-3"):
+                digest = hashlib.sha256(image).hexdigest()
+                slot, sent = display.put("tokentv.gif", image, digest)
+                self.assertNotEqual(slot, display.active)  # never the file the clock plays
+                display.select(original, slot)
+                shown.append(self.state["path"])
+                self.assertEqual(self.state["files"][slot], image)
+            self.assertEqual(shown, ["/image/tokentv.gif", "/image/tokentv-b.gif", "/image/tokentv.gif"])
+            # The same picture again: nothing sent, nothing switched.
+            start = len(self.calls)
+            slot, sent = display.put("tokentv.gif", b"GIF-3", hashlib.sha256(b"GIF-3").hexdigest())
+            display.select(original, slot)
+            self.assertEqual((sent, self.calls[start:]), ([], []))
+            # A still face takes the JPEG pair the same way.
+            slot, _ = display.put("tokentv.jpg", b"JPEG-1", hashlib.sha256(b"JPEG-1").hexdigest())
+            display.select(original, slot)
+            self.assertEqual(self.state["path"], "/image/tokentv.jpg")
+
+    def test_pro_full_clock_sends_nothing(self):
+        from token_tv.device import ClockFull
+        self.state["free"] = 20000
+        with serve(pro_clock(self.state, self.calls)) as url:
+            with self.assertRaises(ClockFull):
+                open_display(url).put("tokentv.gif", b"x" * 1000, "d")
+        self.assertFalse(any(method == "POST" for method, _ in self.calls))
+
+    def test_pro_is_reported_and_verified_on_its_checked_firmware(self):
+        with serve(pro_clock(self.state, self.calls)) as url:
+            info = clock_info(url)
+        self.assertEqual(info, {"kind": "pro", "model": "GeekMagic SmallTV-PRO", "firmware": "V3.4.88EN"})
+        self.assertTrue(verified(info))
+        self.assertFalse(verified(dict(info, firmware="V3.4.90EN")))
+        self.assertFalse(verified(dict(info, kind="ultra")))
+
+    def test_pro_backup_is_refused_on_other_clocks_and_theirs_on_a_pro(self):
+        pro = ProDisplay("http://127.0.0.1:9")
+        pro.check_backup(PRO_BACKUP)
+        for display, backup in ((pro, ULTRA_BACKUP), (pro, SD_PRO_BACKUP), (UltraDisplay("http://127.0.0.1:9"), PRO_BACKUP)):
+            with self.subTest(display=type(display).__name__, backup=backup), self.assertRaises(BackupMismatch):
+                display.check_backup(backup)
 
 
 if __name__ == "__main__":

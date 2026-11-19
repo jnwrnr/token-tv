@@ -15,7 +15,7 @@ not "probably fine".
   TokenTV is a community project with no tie to GeekMagic, and these are plain links, not affiliate links. Buying
   there is a choice, not a requirement: the author's own SD_PRO came from an AliExpress discount.
 - **Safest picks today:** the two cards below, an SD_PRO and a SmallTV-Ultra on `Ultra-V9.0.54` or `9.1.54`.
-  SmallTV and SmallTV-Ultra share the same ESP8266 board; the SmallTV Pro is an ESP32 model and is not checked yet.
+  SmallTV and SmallTV-Ultra share the same ESP8266 board; the SmallTV-PRO is an ESP32 model with its own album API (card below).
   Many look-alikes are sold under other names; they may work if the photo album page behaves the same, but nobody
   has checked them. If you try one, please open an issue with what `token-tv start` printed, so it can get a card.
 
@@ -74,6 +74,19 @@ card yet.
 | Host | Not reported |
 | Date | 2026-10-27 |
 | Evidence | [video in #7](https://github.com/click6067-ship-it/token-tv/pull/7#issuecomment-6433844118) |
+
+### SmallTV-PRO (ESP32) on V3.4.88EN
+
+| Field | |
+| --- | --- |
+| Clock | GeekMagic **SmallTV-PRO**, ESP32 (`/v.json` reports `GeekMagic SmallTV-PRO`) |
+| Firmware | Stock `V3.4.88EN` |
+| What TokenTV uses | `/v.json`, `/.sys/album.json`, `/space.json`, `/doUpload?dir=/image` (form field `update`), `/set?album_path=...&album_autoplay=0`, `/set?open_app=Picture` (first time only) |
+| Still / GIF | Both: the default animated face and still faces applied from the dashboard show on the clock |
+| Notes | Two files per kind are taken in turn, so the picture playing is never written over. Opening the Picture app again while it plays leaves the screen black, so it is opened once and later switches set only the album's picture |
+| Restore | The album's picture and autoplay come back; the app shown before cannot be read, so it is not restored. Not checked on the clock |
+| Host | macOS (Apple Silicon), Python 3.13, TokenTV 0.6.2 from source |
+| Date | 2026-11-19 |
 
 TokenTV never flashes firmware and never deletes your photos. It uploads one picture, switches the
 clock to its photo theme, and `token-tv run --restore-display` puts the original theme back.

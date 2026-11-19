@@ -1,4 +1,5 @@
-"""Confirmed SD_PRO photo API, plus the SmallTV-Ultra image API. Never flash or delete existing photographs."""
+"""Confirmed SD_PRO photo API, plus the SmallTV-Ultra and SmallTV-PRO image APIs. Never flash or delete existing
+photographs."""
 import ipaddress
 import json
 import re
@@ -21,12 +22,28 @@ FILES = ("tokentv.jpg", "tokentv.gif")
 # and its still minutes) on the clock, so coming back is a switch, not a send.
 SLOTS = ("tokentv.gif", "tokentv-b.gif", "tokentv-c.gif")
 # The album page accepts GIFs up to 240×240; keep both well under the free space.
-LIMITS = {"tokentv.jpg": (60000, "image/jpeg"), **{name: (400000, "image/gif") for name in SLOTS}}
+LIMITS = {"tokentv.jpg": (60000, "image/jpeg"), "tokentv-b.jpg": (60000, "image/jpeg"),
+          **{name: (400000, "image/gif") for name in SLOTS}}
 LEGACY_FILES = ("tokentv-c.jpg", "tokentv-m.jpg")
 ROOM = 300000  # bytes of the clock's space a third slot leaves free, for the owner's own photos
 MARGIN = 30000  # and any slot, for the clock's own files
 LIST_SECONDS = 300  # how long the clock's file list is trusted without reading it again
-MODEL_NAMES = {"sdpro": "an SD_PRO", "ultra": "a SmallTV-Ultra"}
+MODEL_NAMES = {"sdpro": "an SD_PRO", "ultra": "a SmallTV-Ultra", "pro": "a SmallTV-PRO"}
+
+
+def model_kind(model):
+    """'ultra', 'pro' or 'sdpro' for the model name a clock's /v.json gives; None when it names no SmallTV.
+    The ESP32 SmallTV-PRO says "GeekMagic SmallTV-PRO" (firmware V3.4.x), the Ultra "SmallTV-Ultra"."""
+    if not isinstance(model, str):
+        return None
+    name = model.strip()
+    if name.lower().startswith("geekmagic "):
+        name = name[len("geekmagic "):]
+    if name.startswith("SmallTV-Ultra"):
+        return "ultra"
+    if name.upper().startswith("SMALLTV-PRO"):
+        return "pro"
+    return "sdpro" if name.startswith("SmallTV") else None
 
 
 class BackupMismatch(ValueError):
@@ -276,6 +293,85 @@ class UltraDisplay(PhotoDisplay):
             self.request(f"/set?theme={int(original['theme'])}")
 
 
+class ProDisplay(UltraDisplay):
+    """SmallTV-PRO (ESP32, firmware V3.4.x) album API, read from the clock's own web UI (V3.4.88EN): uploads go to
+    /doUpload?dir=/image in a field named "update", the album state is /.sys/album.json, the picture is chosen with
+    /set?album_path=...&album_autoplay=0 and the Picture app is brought forward with /set?open_app=Picture.
+    The app the clock showed before cannot be read back, so a restore returns the album's picture and autoplay only."""
+    MODEL = "pro"
+    # Two files per kind, taken in turn: the picture playing is never written over (that left the clock black), and
+    # a new picture always has a new path, so selecting it makes the clock load it instead of keeping its cached one.
+    PRO_SLOTS = {"jpg": ("tokentv.jpg", "tokentv-b.jpg"), "gif": ("tokentv.gif", "tokentv-b.gif")}
+
+    def put(self, name, image, digest):
+        pair = self.PRO_SLOTS["gif" if name.endswith(".gif") else "jpg"]
+        slot = next((s for s in pair if self.held.get(s, (None,))[0] == digest), None)
+        if slot is not None:  # this very picture is already on the clock
+            return slot, []
+        slot = min((s for s in pair if s != self.active), key=lambda s: self.last_used.get(s, 0))
+        _, raw = self.request("/space.json")
+        try:
+            free = int(json.loads(raw).get("free"))
+        except (ValueError, TypeError, AttributeError):
+            raise NotAClock("The address answers, but not as a clock") from None
+        if free - len(image) < MARGIN:
+            raise ClockFull(len(image) + MARGIN, free)
+        self.held.pop(slot, None)
+        receipts = [dict(self.upload(slot, image), sha256=digest)]
+        self.held[slot] = (digest, len(image))
+        return slot, receipts
+
+    def select(self, original, name, on=None):
+        try:
+            if self.active != name:
+                self.activate(original, name)
+                if on:
+                    on()
+        except Exception:
+            self.active = None
+            raise
+        self.active = name
+        self.turns += 1
+        self.last_used[name] = self.turns
+
+    def capture(self):
+        _, raw = self.request("/.sys/album.json")
+        try:
+            album = json.loads(raw)
+            return {"model": self.MODEL, "autoplay": int(album.get("autoplay") or 0),
+                    "path": str(album.get("path") or "")}
+        except (ValueError, TypeError, AttributeError):
+            raise NotAClock("The address answers, but not as a clock") from None
+
+    def upload(self, name, image):
+        limit, mime = LIMITS.get(name, (0, ""))
+        if not image or len(image) > limit:
+            raise ValueError("Unexpected display image")
+        boundary = "TokenTV" + uuid.uuid4().hex
+        body = (f'--{boundary}\r\nContent-Disposition: form-data; name="update"; filename="{name}"\r\n'
+                f'Content-Type: {mime}\r\n\r\n').encode() + image + f"\r\n--{boundary}--\r\n".encode()
+        status, _ = self.request("/doUpload?dir=" + quote("/image", safe=""), body,
+                                 {"Content-Type": "multipart/form-data; boundary=" + boundary})
+        return {"file": name, "status": status, "bytes": len(image)}
+
+    def activate(self, original, name=FILES[0]):
+        # Open the Picture app only when we have not put it up yet: opening it again while it plays reloads it and
+        # leaves the screen black (seen on V3.4.88EN). A switch between our files sets the album's picture alone,
+        # as the clock's own web UI does; autoplay off, so the owner's photos never rotate in.
+        if self.active is None:
+            self.request("/set?open_app=Picture")
+        self.request("/set?" + urlencode({"album_path": "/image/" + name, "album_autoplay": 0}, quote_via=quote))
+
+    def restore(self, original):
+        query = {"album_autoplay": int(original.get("autoplay") or 0)}
+        if original.get("path"):
+            query["album_path"] = original["path"]
+        self.request("/set?" + urlencode(query, quote_via=quote))
+
+
+DISPLAYS = {"ultra": UltraDisplay, "pro": ProDisplay}
+
+
 def open_display(base_url):
     display = PhotoDisplay(base_url)
     try:
@@ -284,7 +380,8 @@ def open_display(base_url):
     except (OSError, ValueError, AttributeError, HTTPException):
         display.guessed = True  # an Ultra that is off reads as an SD_PRO until it answers
         return display
-    return UltraDisplay(base_url) if isinstance(model, str) and model.startswith("SmallTV-Ultra") else display
+    kind = DISPLAYS.get(model_kind(model))
+    return kind(base_url) if kind else display
 
 
 DIRECT = build_opener(ProxyHandler({}))
@@ -299,9 +396,9 @@ def clock_model(base_url, timeout=3):
         with opener.open(Request(base_url + path), timeout=timeout) as response:
             return json.loads(response.read(65536))
     try:
-        model = get("/v.json").get("m")
-        if isinstance(model, str) and model.startswith("SmallTV"):
-            return "ultra" if model.startswith("SmallTV-Ultra") else "sdpro"
+        kind = model_kind(get("/v.json").get("m"))
+        if kind:
+            return kind
     except HTTPError:
         pass  # something answers there: an SD_PRO has no /v.json
     except (OSError, ValueError, AttributeError, HTTPException):
@@ -318,6 +415,7 @@ def clock_model(base_url, timeout=3):
 # Model and firmware pairs checked on a real clock (docs/hardware-compatibility.md): the SD_PRO's photo-album web UI,
 # which reports no version, and the SmallTV-Ultra on these firmware versions.
 VERIFIED_ULTRA = ('9.0.54', '9.1.54')
+VERIFIED_PRO = ('3.4.88',)
 REPORT_URL = 'https://github.com/click6067-ship-it/token-tv/issues/new?template=hardware_compatibility.md'
 
 
@@ -330,9 +428,10 @@ def clock_info(base_url, timeout=3):
     try:
         said = get("/v.json")
         model = said.get("m") if isinstance(said, dict) else None
-        if isinstance(model, str) and model.startswith("SmallTV"):
+        kind = model_kind(model)
+        if kind:
             version = said.get("v")
-            return {"kind": "ultra" if model.startswith("SmallTV-Ultra") else "sdpro", "model": model,
+            return {"kind": kind, "model": model,
                     "firmware": version if isinstance(version, str) and version.strip() else None}
     except HTTPError:
         pass  # an SD_PRO has no /v.json
@@ -354,7 +453,8 @@ def verified(info):
     if info.get("kind") == "sdpro":
         return info.get("model") == "SD_PRO"  # the SD_PRO web UI, which reports no firmware version
     found = re.search(r"(?<![\d.])(\d+\.\d+\.\d+)(?![\d.])", info.get("firmware") or "")
-    return info.get("kind") == "ultra" and bool(found) and found.group(1) in VERIFIED_ULTRA
+    versions = {"ultra": VERIFIED_ULTRA, "pro": VERIFIED_PRO}.get(info.get("kind"), ())
+    return bool(found) and found.group(1) in versions
 
 
 def local_addresses():
